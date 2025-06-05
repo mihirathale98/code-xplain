@@ -1,0 +1,1202 @@
+"relative_path","code"
+"make_messages.py","##
+from datasets import load_dataset
+
+data_path = ""GAIR/LIMO""
+output_path = ""./limo_messages.jsonl""
+dataset = load_dataset(data_path, split=""train"")
+
+dataset
+'''
+shows:
+    Out[2]: 
+    Dataset({
+        features: ['question', 'solution', 'answer'],
+        num_rows: 817
+    })
+'''
+
+##
+def make_messages(sample: dict):
+    x = sample['question']
+    y = sample['solution']
+    messages = [
+        {""role"": ""user"", ""content"": x},
+        {""role"": ""assistant"", ""content"": y}
+    ]
+    sample['messages'] = messages
+    return sample
+
+dataset = dataset.map(make_messages, num_proc=8)
+dataset.to_json(output_path)
+
+
+
+
+
+
+"
+"utils.py","from datetime import timedelta
+import importlib
+import inspect
+import logging
+import os
+from typing import Any
+
+import torch
+from torch.distributed import is_initialized, get_rank
+from rich.logging import RichHandler
+
+def get_caller(num_frames=1):
+    frame = inspect.currentframe().f_back
+    for _ in range(num_frames - 1):
+        frame = frame.f_back
+    file_name = frame.f_code.co_filename
+    line_number = frame.f_lineno
+    return f""In {file_name}, line {line_number}""
+
+def log_rank_0(msg, include_caller=False, rank=None, to_print=False):
+    if rank is None:
+        rank = get_rank() if is_initialized() else 0
+    if rank <= 0:
+        if include_caller:
+            msg = f""{get_caller(num_frames=2)}: {msg}""
+        if to_print:
+            print(msg)
+        else:
+            logging.info(msg)
+
+def setup_logger(level=""DEBUG""):
+    logging.basicConfig(
+        level=level, format=""%(message)s"", datefmt=""[%X]"", handlers=[RichHandler()]
+    )
+
+def patch_target_module(
+    to_patch: str,
+    replace_with: Any,
+):
+    to_patch = to_patch.split(""."")
+    assert len(to_patch) > 1, ""must have an object to patch""
+
+    to_patch, obj_name_to_patch = to_patch[:-1], to_patch[-1]
+    to_patch = ""."".join(to_patch)
+    source = importlib.import_module(to_patch)
+    setattr(source, obj_name_to_patch, replace_with)
+
+def init_distributed_environment():
+    torch.cuda.set_device(int(os.environ[""LOCAL_RANK""]))
+    torch.distributed.init_process_group(""nccl"", timeout=timedelta(minutes=180))
+    tensor = torch.ByteTensor([False]).cuda()
+    torch.distributed.all_reduce(tensor)
+    torch.distributed.barrier()"
+"setup_model_for_training.py","import math
+import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+from utils import log_rank_0, patch_target_module
+
+def get_module_class_from_name(
+    model: torch.nn.Module, name: str
+) -> torch.nn.Module | None:
+    modules_children = list(model.children())
+
+    if model.__class__.__name__ == name:
+        return model.__class__
+    elif len(modules_children) == 0:
+        return
+    else:
+        for child_module in modules_children:
+            module_class = get_module_class_from_name(child_module, name)
+            if module_class is not None:
+                return module_class
+            
+def wrap_fsdp2(model: torch.nn.Module) -> torch.nn.Module:
+    """"""
+    Wrap `model` in PyTorch FSDP2 with full sharding and transformer auto-wrap policy under BF16.
+    """"""
+    # Determine the block class to auto-wrap (first no-split module)
+    block_name = model._no_split_modules[0]
+    block_cls = get_module_class_from_name(model, block_name)
+    if block_cls is None:
+        raise ValueError(f""Could not find module class named {block_name}"")
+    
+    # Mixed-precision policy for BF16
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, 
+        reduce_dtype=torch.bfloat16, 
+        output_dtype=torch.bfloat16, 
+        cast_forward_inputs=True)
+
+    # FSDP2 settings: full shard, BF16, no CPU offload
+    fsdp2_kwargs = {
+        ""mp_policy"": mp_policy,
+        ""reshard_after_forward"": True,
+
+    }
+
+    # Auto-wrap child modules
+    for module in model.modules():
+        if isinstance(module, block_cls):
+            fully_shard(module, **fsdp2_kwargs)
+
+    # Wrap the full model
+    fully_shard(model, **fsdp2_kwargs)
+    model = model.to(torch.float32)
+    return model
+
+def align_model_and_tokenizer(model, tokenizer):
+    """"""
+    Aligns the model's vocabulary and special tokens with the tokenizer.
+    """"""
+    if len(tokenizer) > model.config.vocab_size:
+        print(
+            f""WARNING: tokenizer has {len(tokenizer)} tokens but model has {model.config.vocab_size} vocab size""
+        )
+        model.resize_token_embeddings(
+            int(8 * math.ceil(len(tokenizer) / 8.0))
+        )  # make the vocab size multiple of 8 for sharding the embedding layer.
+
+    # Fix any discrepancy between model and tokenizer
+    special_tokens = {
+        'pad': ('pad_token_id', 'Fixing model pad token id'),
+        'bos': ('bos_token_id', 'Fixing model bos token id'),
+        'eos': ('eos_token_id', 'Fixing model eos token id')
+    }
+
+    for token_type, (token_attr, message) in special_tokens.items():
+        model_token = getattr(model.config, token_attr)
+        tokenizer_token = getattr(tokenizer, token_attr)
+        
+        if (model_token is not None and tokenizer_token is not None 
+            and model_token != tokenizer_token):
+            log_rank_0(
+                ""\033[38;5;226m""
+                f""WARNING: There is a mismatch between {token_type} token id of ""
+                f""model({model_token}) and tokenizer({tokenizer_token}). ""
+                f""{message} to be same as tokenizer's {token_type} token id""
+                ""\033[0m""
+            )
+            setattr(model.config, token_attr, tokenizer_token)
+
+    return model
+
+def setup_model(model=None, **kwargs):
+    base_model_args = {
+        ""pretrained_model_name_or_path"": kwargs['model_name_or_path'],
+        ""torch_dtype"": torch.bfloat16,
+    }
+    base_model_args[""attn_implementation""] = ""flash_attention_2""
+
+    if kwargs['use_liger_kernels']:
+        '''need to patch the loss function to not reduce, so we can reduce across all GPUs'''
+        from none_reduction_losses import liger_fixed_fused_linear_cross_entropy_none_reduction
+        patch_target_module(""liger_kernel.transformers.model.loss_utils.fixed_fused_linear_cross_entropy"", 
+                            liger_fixed_fused_linear_cross_entropy_none_reduction)
+        from liger_kernel.transformers import AutoLigerKernelForCausalLM
+        model = AutoLigerKernelForCausalLM.from_pretrained(**base_model_args)
+    else:
+        from none_reduction_losses import hf_fixed_cross_entropy_none_reduction
+        patch_target_module(""transformers.loss.loss_utils.fixed_cross_entropy"", 
+                            hf_fixed_cross_entropy_none_reduction)
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(**base_model_args)
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(kwargs['model_name_or_path'])
+    model = align_model_and_tokenizer(model, tokenizer)
+
+    if model.__class__.__name__ not in [
+        ""MistralForCausalLM"",
+        ""GPTDolomiteForCausalLM"", 
+        ""LlamaForCausalLM"",
+        ""Starcoder2ForCausalLM"",
+        ""GemmaForCausalLM"",
+        ""MixtralForCausalLM"",
+        ""GraniteForCausalLM"",
+    ]:
+        log_rank_0(
+            f""\033[38;2;255;255;0mWarning: Model class name: {model.__class__.__name__} is not in the list of supported models.\033[0m"",
+            to_print=True,
+        )
+
+    model.gradient_checkpointing_enable()
+    # torch.compile(model)
+    return model
+
+def setup_training_components(model, **kwargs):
+    from transformers import get_scheduler
+    model = wrap_fsdp2(model)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=kwargs['learning_rate'],
+        betas=(0.9, 0.95),
+        weight_decay=0.0,
+    )
+    lr_scheduler = get_scheduler(
+        name=kwargs['lr_scheduler'],
+        optimizer=optimizer,
+        num_warmup_steps=kwargs['num_warmup_steps'],
+    )
+    lr_scheduler.split_batches = True
+    lr_scheduler.step() #the scheduler starts at 0 and there's no learning.
+    return model, optimizer, lr_scheduler
+
+if __name__ == ""__main__"":
+    from utils import init_distributed_environment
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict
+    init_distributed_environment()
+    cpu_pg = dist.new_group(backend=""gloo"")
+    # model_name_or_path = '/dev/shm/Llama-3.1-8B-Instruct/'
+    # model_name_or_path = '/dev/shm/test_save'
+    model_name_or_path = 'Qwen/Qwen2.5-1.5B-instruct'
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    model = setup_model(model_name_or_path=model_name_or_path, use_liger_kernels=True)
+    model, optimizer, lr_scheduler = setup_training_components(model, 
+                                                        learning_rate=1e-5,
+                                                        num_warmup_steps=10,
+                                                        lr_scheduler=""constant_with_warmup"")
+    import os
+    inputs = tokenizer(""Hello FSDP2!"", return_tensors=""pt"").to(int(os.environ[""LOCAL_RANK""]))
+    outputs = model(**inputs, labels=inputs.input_ids)
+    print(f""Output logits shape: {outputs.logits.shape}"")
+    # state_dict = model.state_dict()
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+    state_dict = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True))
+    torch.distributed.barrier()
+    # from test_async_save import ModelWrapper
+    # wrapper = ModelWrapper(model)
+    ckpt_path = os.path.abspath(""fsdp2_ckpt"")
+    from test_model_wrap import save_model
+    save_model(model, tokenizer, ckpt_path)
+    model_ = setup_model(model_name_or_path=ckpt_path, use_liger_kernels=True)
+
+    # future = async_save(state_dict, checkpoint_id=ckpt_path, process_group=cpu_pg)
+    # print(f""Async save started: {ckpt_path}"")
+    # future.result()
+    # print(f""Async save finished: {ckpt_path}"")
+
+    if os.environ.get(""RANK"") == ""0"":
+        from IPython import embed; embed()
+    torch.distributed.checkpoint.load(state_dict, checkpoint_id=ckpt_path)
+    torch.distributed.barrier()
+    torch.distributed.destroy_process_group()
+    # import shutil
+    # output_dir = Path(""/new_data/experiments_rh/llama_knowledge_mini_trainer_pipe_cleaner_v2/hf_format/test_save"")
+    # # output_dir = Path(""/dev/shm/test_save"")
+    # shutil.rmtree(output_dir, ignore_errors=True)
+    # output_dir.mkdir(parents=True, exist_ok=True)
+    # accelerator.save_model(model,
+    #                     str(output_dir),
+    #                     max_shard_size=""5GB"",
+    #                     safe_serialization=True,
+    # )
+    # if accelerator.is_main_process:
+    #     from transformers import AutoTokenizer
+    #     model.module.config.to_json_file(str(output_dir / ""config.json""))
+    #     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    #     tokenizer.save_pretrained(output_dir)
+    #     from IPython import embed
+    #     embed()
+    # torch.distributed.barrier()
+    # model = setup_model(model_name_or_path=output_dir, use_liger_kernels=True)
+
+'''
+torchrun --nnodes=1 --nproc-per-node=8 setup_model_for_training.py
+'''"
+"train.py","import time
+import os
+from pathlib import Path
+from enum import Enum
+import json
+
+from typer import Typer, Option
+
+from async_structured_logger import AsyncStructuredLogger
+import torch
+
+from batch_metrics import BatchMetrics
+from sampler import get_data_loader
+from setup_model_for_training import setup_model, setup_training_components
+from utils import init_distributed_environment, log_rank_0, setup_logger
+
+app = Typer(
+    pretty_exceptions_show_locals=False,  # Hide local variables in tracebacks
+    pretty_exceptions_short=True   
+)
+
+def take_gradient_step(model, optimizer, lr_scheduler):
+    """"""Scales gradients, applies clipping, and takes an optimization step.""""""
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    lr_scheduler.step()
+    optimizer.zero_grad()
+    return grad_norm
+
+def save_model(fsdp_model, samples_seen, output_dir, model_name_or_path):
+    from huggingface_hub import split_torch_state_dict_into_shards
+    from transformers import AutoTokenizer
+    from safetensors.torch import save_file
+    # Only on rank 0
+    log_rank_0(f""Saving model at {samples_seen} samples"")
+    start = time.time()
+    rank = torch.distributed.get_rank()
+    save_directory = Path(output_dir) / ""hf_format"" / f""samples_{samples_seen}""
+    os.makedirs(save_directory, exist_ok=True)
+    # Get full state dict
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+    state_dict = get_model_state_dict(fsdp_model, options=StateDictOptions(full_state_dict=True))
+    state_dict = {k:v.to(torch.bfloat16) for k,v in state_dict.items()}
+    
+    if rank == 0:
+        pattern = ""model{suffix}.safetensors""
+        index_name = ""model.safetensors.index.json""
+        
+        # Shard splitting
+        split = split_torch_state_dict_into_shards(
+            state_dict, filename_pattern=pattern, max_shard_size=""5GB"",
+        )
+        # Save shards
+        for filename, tensors in split.filename_to_tensors.items():
+            shard = {k: state_dict[k] for k in tensors}
+            path = os.path.join(save_directory, filename)
+            save_file(shard, path)
+            
+        # Save index if sharded
+        if split.is_sharded:
+            index = {""metadata"": split.metadata, ""weight_map"": split.tensor_to_filename}
+            with open(os.path.join(save_directory, index_name), ""w"") as f:
+                json.dump(index, f, indent=2, sort_keys=True)
+        # Save config and tokenizer (unwrap inner module)
+        inner = getattr(fsdp_model, ""module"", fsdp_model)
+        inner.config.to_json_file(os.path.join(save_directory, ""config.json""))
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        tokenizer.save_pretrained(save_directory)
+        log_rank_0(f""\033[1;38;2;0;255;255mSaved model at\033[0m {samples_seen} samples in {time.time() - start:.2f} seconds"")
+    torch.distributed.barrier()
+
+def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_per_checkpoint, model_name_or_path):
+    model.train()
+    metric_logger = AsyncStructuredLogger(output_dir + f""/training_metrics_{os.environ.get('RANK')}.jsonl"")
+    world_size = int(os.environ[""WORLD_SIZE""])
+    is_main_process = os.environ.get(""RANK"") == ""0""
+
+    batch_totals = BatchMetrics()
+    step = 0
+    total_samples_accumulated = 0
+    last_saved_samples = 0
+    device = next(model.parameters()).device
+    
+    data_loader = iter(data_loader)
+    for batch in data_loader:
+        batch_start_time = time.time()
+        batch_totals.reset_batch()
+        torch.cuda.reset_peak_memory_stats()
+        for grad_accum, mb in enumerate(batch):
+
+            mb_start_time = time.time()
+            mb_num_loss_counted_tokens = mb.pop('num_loss_counted_tokens')
+            mb_num_samples = mb.pop('num_samples')
+            batch_num_loss_counted_tokens = mb.pop('batch_num_loss_counted_tokens')
+            mb = {k: v.to(device) for k, v in mb.items()}
+            # torch.distributed.breakpoint()
+            output = model(**mb)
+            loss = output.loss.float().sum() 
+            loss_metrics = loss.detach().item()
+            '''multiply by world_size to account for the fact that fsdp takes the mean of the gradients across the world_size'''
+            '''the loss is a sum of all cross entropy losses for all tokens in the batch, we divide by batch_num_loss_counted_tokens to get the average loss per token'''
+            loss = loss * world_size / batch_num_loss_counted_tokens
+
+            loss.backward()
+            torch.cuda.empty_cache()
+
+            batch_totals.accumulate_minibatch_metrics(
+                num_loss_counted_tokens=mb_num_loss_counted_tokens,
+                num_total_tokens=mb['input_ids'].shape[1],
+                num_samples=mb_num_samples,
+                loss=loss_metrics,
+                loss_backward=loss.detach().item()/world_size,
+                time_per_minibatch=time.time() - mb_start_time,
+            )
+        step += 1
+        #sum the metrics from all processes
+        batch_totals.reduce_batch_metrics(device)
+        
+        #use accumulated metrics to take a gradient step and logging
+        bm = batch_totals.totals
+        total_samples_accumulated += bm['num_samples']
+        grad_norm = take_gradient_step(model, optimizer, lr_scheduler)
+
+        if is_main_process:
+            batch_time = time.time() - batch_start_time
+            batch_metrics = {
+                    ""step"": step,
+                    ""lr"": lr_scheduler.get_last_lr()[0],
+                    ""grad_norm"": grad_norm.item(),
+                    ""loss"": bm['loss']/batch_num_loss_counted_tokens,
+                    ""avg_loss_backward"": bm['loss_backward']/(grad_accum+1),
+                    ""num_samples"": bm['num_samples'],
+                    ""num_loss_counted_tokens"": bm['num_loss_counted_tokens'],
+                    ""batch_num_loss_counted_tokens"": batch_num_loss_counted_tokens,
+                    ""num_total_tokens"": bm['num_total_tokens'],
+                    ""grad_accum"": grad_accum+1,
+                    ""avg_time_per_minibatch"": bm['time_per_minibatch']/(grad_accum+1)/world_size,
+                    ""time_per_batch"": batch_time,
+                    ""tokens_per_second"": bm['num_total_tokens']/batch_time,
+                    ""total_samples_accumulated"": total_samples_accumulated, 
+                    ""samples_per_second"": bm['num_samples']/batch_time,
+                    ""peak_memory_usage_GB"": float(torch.cuda.max_memory_allocated() / 1e9),
+                }
+            metric_logger.log_sync(
+                batch_metrics
+            )
+        
+        torch.distributed.barrier()
+        if total_samples_accumulated - last_saved_samples >= min_samples_per_checkpoint:
+            save_model(model, total_samples_accumulated, output_dir, model_name_or_path)
+            last_saved_samples = total_samples_accumulated
+
+class LogLevelEnum(str, Enum):
+    DEBUG = ""DEBUG""
+    INFO = ""INFO""
+    WARNING = ""WARNING""
+    ERROR = ""ERROR""
+    CRITICAL = ""CRITICAL""
+
+@app.command()
+def main(
+    model_name_or_path: str = Option(""Qwen/Qwen2.5-1.5B-Instruct"", help=""Model name or path""),
+    data_path: str = Option(""test.jsonl"", help=""Path to the training data JSONL file""),
+    batch_size: int = Option(1024, help=""Initial batch size before dynamic splitting""),
+    max_tokens_per_gpu: int = Option(10000, help=""Maximum tokens per GPU per minibatch""),
+    learning_rate: float = Option(5e-6, help=""Peak learning rate""),
+    num_warmup_steps: int = Option(10, help=""Number of warmup steps for the LR scheduler""),
+    lr_scheduler: str = Option(""constant_with_warmup"", help=""Learning rate scheduler type""),
+    seed: int = Option(42, help=""Random seed for reproducibility""),
+    use_liger_kernels: bool = Option(False, help=""Whether to use Liger kernels""),
+    output_dir: str = Option(..., help=""Directory to save checkpoints and logs (required)""),
+    logging_level: LogLevelEnum = Option(
+        LogLevelEnum.INFO, 
+        help=""Logging level"", 
+        case_sensitive=False
+    ),
+    min_samples_per_checkpoint: int = Option(..., help=""Minimum number of samples processed before saving a checkpoint (required)""),
+):
+    init_distributed_environment()
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Log parameters only on rank 0
+    rank = int(os.environ.get(""RANK"", 0))
+    if rank == 0:
+        params = {
+            ""model_name_or_path"": model_name_or_path,
+            ""data_path"": data_path,
+            ""batch_size"": batch_size,
+            ""max_tokens_per_gpu"": max_tokens_per_gpu,
+            ""learning_rate"": learning_rate,
+            ""num_warmup_steps"": num_warmup_steps,
+            ""lr_scheduler"": lr_scheduler,
+            ""seed"": seed,
+            ""use_liger_kernels"": use_liger_kernels,
+            ""output_dir"": output_dir,
+            ""logging_level"": logging_level.value,
+            ""min_samples_per_checkpoint"": min_samples_per_checkpoint,
+            ""RANK"": rank, # Include rank itself, though it will be 0 here
+            ""WORLD_SIZE"": int(os.environ.get(""WORLD_SIZE"", 1))
+        }
+        params_path = output_path / f""training_params.json""
+        with open(params_path, 'w') as f:
+            json.dump(params, f, indent=4)
+        # Pretty print parameters in a single line using JSON
+        print(f""Training with parameters: {json.dumps(params, separators=(',', ':'), indent=4)}"")
+        print(f""Training parameters saved to {params_path}"")
+
+    setup_logger(level=logging_level.value)
+    model = setup_model(model_name_or_path=model_name_or_path,
+                        use_liger_kernels=use_liger_kernels,)
+    model, optimizer, lr_scheduler = setup_training_components(model,
+                                                               learning_rate=learning_rate,
+                                                               num_warmup_steps=num_warmup_steps,
+                                                               lr_scheduler=lr_scheduler)
+    data_loader = get_data_loader(data_path=data_path,
+                                  batch_size=batch_size,
+                                  max_tokens_per_gpu=max_tokens_per_gpu,
+                                  seed=seed)
+    
+    train(model, 
+          optimizer, 
+          lr_scheduler, 
+          data_loader, 
+          output_dir, 
+          min_samples_per_checkpoint,
+          model_name_or_path)
+    
+if __name__ == ""__main__"":
+    app()
+
+
+'''
+rclone copy --copy-links /new_data/experiments_rh/phi-4_limo_trainer_pipe_cleaner/hf_format/samples_8192.0 /dev/shm/phi-4_limo_trainer_pipe_cleaner_cont
+        --data-path /dev/shm/knowledge_processed.jsonl \
+        --data-path ./some_product_puzzle_tokenized_qwen1.5b.jsonl \
+        --data-path ./mihir_prob.jsonl \
+        --output-dir /new_data/experiments_rh/mihir_prob_qwen1.5b_v2     \
+torchrun --nnodes=1 --nproc-per-node=8 train.py   \
+        --output-dir /new_data/experiments_rh/siddantv2/     \
+        --data-path ./siddhant.jsonl \
+        --model-name-or-path Qwen/Qwen2.5-1.5B-instruct \
+        --min-samples-per-checkpoint 10000      \
+        --num-warmup-steps 20 \
+        --max-tokens-per-gpu 60000              \
+        --batch-size 128                       \
+        --use-liger-kernels                    \
+        --seed 893                               \
+        --fsdp-sharding-strategy FULL_SHARD \
+        --learning-rate 6e-6
+'''"
+"batch_metrics.py","from collections import defaultdict
+import torch
+
+class BatchMetrics:
+    def __init__(self):
+        # Initialize metrics storage for each batch
+        self.totals = defaultdict(float)
+        self.minibatch_metrics = defaultdict(float)
+
+    def accumulate_minibatch_metrics(self, **kwargs):
+        """"""
+        Accumulate metrics using a dictionary of new values.
+        The keys of new_values should correspond to the attributes of this dataclass.
+        This method adds the new value to the existing metric. 
+        """"""
+        for key, value in kwargs.items():
+            self.minibatch_metrics[key] += value
+
+    def reduce_batch_metrics(self, device):
+        """"""
+        Reduce the minibatch metrics across all processes.
+        """"""
+        # Create a tensor from the minibatch_metrics values in the order of keys
+        keys = list(self.minibatch_metrics.keys())
+        tensor = torch.tensor([float(self.minibatch_metrics[k]) for k in keys], device=device)
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+        # Store reduced values for this batch
+        self.totals = {key: value for key, value in zip(keys, tensor.tolist())}
+        # Reset minibatch metrics
+        self.minibatch_metrics.clear()
+
+    def reset_batch(self):
+        """"""Clear all accumulated metrics before starting a new batch.""""""
+        self.totals.clear()
+        self.minibatch_metrics.clear()"
+"async_structured_logger.py","# SPDX-License-Identifier: Apache-2.0
+
+# Standard
+from datetime import datetime
+import asyncio
+import json
+import threading
+
+# Third Party
+import aiofiles
+
+
+class AsyncStructuredLogger:
+    def __init__(self, file_name=""training_log.jsonl""):
+        self.file_name = file_name
+        self.logs = []
+        self.loop = asyncio.new_event_loop()
+        t = threading.Thread(
+            target=self._run_event_loop, args=(self.loop,), daemon=True
+        )
+        t.start()
+        asyncio.run_coroutine_threadsafe(self._initialize_log_file(), self.loop)
+
+    def _run_event_loop(self, loop):
+        asyncio.set_event_loop(loop)  #
+        loop.run_forever()
+
+    async def _initialize_log_file(self):
+        self.logs = []
+        try:
+            async with aiofiles.open(self.file_name, ""r"") as f:
+                async for line in f:
+                    if line.strip():  # Avoid empty lines
+                        self.logs.append(json.loads(line.strip()))
+        except FileNotFoundError:
+            # File does not exist but the first log will create it.
+            pass
+
+    async def log(self, data):
+        """"""logs a dictionary as a new line in a jsonl file with a timestamp""""""
+        try:
+            if not isinstance(data, dict):
+                raise ValueError(""Logged data must be a dictionary"")
+            data[""timestamp""] = datetime.now().isoformat()
+            self.logs.append(data)
+            await self._write_logs_to_file(data)
+            print(f""\033[92m{json.dumps(data, indent=4)}\033[0m"")
+        except Exception as e:
+            print(f""\033[1;38;2;0;255;255mError logging data: {e}\033[0m"")
+
+    async def _write_logs_to_file(self, data):
+        """"""appends to the log instead of writing the whole log each time""""""
+        async with aiofiles.open(self.file_name, ""a"") as f:
+            await f.write(json.dumps(data, indent=None) + ""\n"")
+
+    def log_sync(self, data: dict):
+        """"""runs the log coroutine non-blocking""""""
+        asyncio.run_coroutine_threadsafe(self.log(data), self.loop)
+
+    def __repr__(self):
+        return f""<AsyncStructuredLogger(file_name={self.file_name})>""
+"
+"process_data.py","from pathlib import Path
+import typer
+from datasets import load_dataset
+from transformers import AutoTokenizer
+import numpy as np
+
+app = typer.Typer()
+
+
+def make_input_ids_from_messages(sample: dict, tokenizer):
+    sample['pretrain'] = False
+    sample['error'] = False
+    sample['input_ids'] = None
+    sample['len'] = None
+    try:
+        roles = [s['role'] for s in sample[""messages""]]
+
+        if ""pretrain"" in roles:
+            assert len(roles) == 1
+            content = sample[""messages""][0][""content""]
+            sample['input_ids'] = tokenizer.encode(content + tokenizer.eos_token, add_special_tokens=False) 
+            sample['pretrain'] = True
+        else:
+            sample['input_ids'] = tokenizer.apply_chat_template(sample['messages'], tokenize=True)
+            messages = sample['messages']
+            for m in messages:
+                if m['role'] == ""assistant"" and not m['content']:
+                    sample['error'] = True
+        sample['len'] = len(sample['input_ids'])
+        return sample
+    except Exception as e:
+        sample['error'] = True
+        return sample
+
+def make_labels_from_input_ids(sample: dict, assistant_tk_ids: list, user_tk_ids: list):
+    '''    
+    Create training labels by unmasking only the assistant's reply tokens and masking all other tokens (user messages and special delimiters) with -100. For pretraining samples, labels equal the input_ids.
+    '''
+    if sample['pretrain']:
+        sample['labels'] = sample['input_ids']
+        return sample
+    
+    original_ids = sample['input_ids']
+    labels = []
+    unmasking = False
+    i = 0
+    while i < len(original_ids):
+        # Check if the next tokens match the assistant delimiter sequence
+        if original_ids[i:i+len(assistant_tk_ids)] == assistant_tk_ids:
+            unmasking = True
+            labels.extend([-100 for _ in assistant_tk_ids])
+            i += len(assistant_tk_ids)
+            continue
+        # Check if the next tokens match the user delimiter sequence
+        elif original_ids[i:i+len(user_tk_ids)] == user_tk_ids:
+            unmasking = False
+            # i += len(user_tk_ids)
+            # continue
+        # else:
+        token = original_ids[i]
+        if unmasking:
+            labels.append(token)
+        else:
+            labels.append(-100)
+        i += 1
+
+    sample['labels'] = labels
+    return sample
+
+def make_num_loss_tokens_from_labels(sample: dict):
+    sample['num_loss_counted_tokens'] = sum([l != -100 for l in sample['labels']])
+    return sample
+
+def infer_special_token_sequences(tokenizer):
+    '''
+    this function tries to infer the special token sequences from the tokenizer.
+    Sometimes the chat template adds some tokens to the messages in between that should be unmasked.
+    '''
+    tk_1 = tokenizer.encode(""1"", add_special_tokens=False)
+    assert len(tk_1) == 1
+    tk_1 = tk_1[0]
+    
+    messages = [
+        {""role"": ""user"", ""content"": ""1""},
+        {""role"": ""assistant"", ""content"": ""1""},
+    ]
+    input_ids = tokenizer.apply_chat_template(messages, tokenize=True)
+    assert sum([t == tk_1 for t in input_ids]) == 2, ""tk_1 should be only 2 times to infer the special token sequences""
+    tk_1_first_idx = [i for i, t in enumerate(input_ids) if t == tk_1][0]
+    tk_1_second_idx = [i for i, t in enumerate(input_ids) if t == tk_1][1]
+    
+    user_tk_ids_1 = input_ids[:tk_1_first_idx]
+    assistant_tk_ids_1 = input_ids[tk_1_first_idx+1:tk_1_second_idx]
+
+    messages = [
+        {""role"": ""assistant"", ""content"": ""1""},
+        {""role"": ""user"", ""content"": ""1""},
+    ]
+    input_ids = tokenizer.apply_chat_template(messages, tokenize=True)
+    assert sum([t == tk_1 for t in input_ids]) == 2, ""tk_1 should be only 2 times to infer the special token sequences""
+    tk_1_first_idx = [i for i, t in enumerate(input_ids) if t == tk_1][0]
+    tk_1_second_idx = [i for i, t in enumerate(input_ids) if t == tk_1][1]
+
+    user_tk_ids_2 = input_ids[tk_1_first_idx+1:tk_1_second_idx]
+    assistant_tk_ids_2 = input_ids[:tk_1_first_idx]
+
+    def longest_common_subsequence(seq1, seq2):
+        """"""Return the longest common subsequence (LCS) between two sequences using dynamic programming.""""""
+        m, n = len(seq1), len(seq2)
+        # dp[i][j] will hold the length of the LCS of seq1[:i] and seq2[:j]
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        
+        # Build the dp table
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if seq1[i - 1] == seq2[j - 1]:
+                    dp[i][j] = dp[i - 1][j - 1] + 1
+                else:
+                    dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+        
+        # Reconstruct the LCS from the dp table
+        lcs = []
+        i, j = m, n
+        while i > 0 and j > 0:
+            if seq1[i - 1] == seq2[j - 1]:
+                lcs.append(seq1[i - 1])
+                i -= 1
+                j -= 1
+            elif dp[i - 1][j] >= dp[i][j - 1]:
+                i -= 1
+            else:
+                j -= 1
+        lcs.reverse()
+        return lcs
+
+    assistant_tk_ids = longest_common_subsequence(assistant_tk_ids_1, assistant_tk_ids_2)
+    user_tk_ids = longest_common_subsequence(user_tk_ids_1, user_tk_ids_2)
+    return assistant_tk_ids, user_tk_ids
+
+@app.command()
+def process_data(
+    input_jsonl: str = typer.Option(..., ""--input-file"",
+                                    help=""path to the input jsonl file""),
+    output_jsonl: str = typer.Option(..., ""--output-file"",
+                                     help=""path to the output tokenizedjsonl file""),
+    model_name_or_path: str = typer.Option(..., ""--model-name-or-path""),
+    max_sample_num_tokens: int = typer.Option(2147483647, 
+                                              help=""max number of tokens in a sample, samples longer than this will be removed""),
+    string_for_printing_masks: str = typer.Option(""<|mAsK|>"", ""--string-for-printing-masks"", 
+                                                  help=""when printing samples at the end, the masked tokens in the labels will be replaced with this string""),
+):
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    assistant_tk_ids, user_tk_ids = infer_special_token_sequences(tokenizer)
+    tokenizer.add_special_tokens({""additional_special_tokens"": [string_for_printing_masks]})
+    string_for_printing_masks_tk = tokenizer.encode(string_for_printing_masks, add_special_tokens=False)[0]
+
+    dataset = load_dataset(""json"", data_files=input_jsonl, split=""train"")
+    
+    dataset_with_input_ids = dataset.map(
+        lambda x: make_input_ids_from_messages(x, tokenizer),
+        num_proc=64,
+    )
+    dataset_with_input_ids = dataset_with_input_ids.filter(lambda x: not x['error'], 
+                                                           num_proc=64,
+                                                    )
+    print(""\033[38;5;196m"" + f""Total number of filtered samples after removing samples with errors: {len(dataset) - len(dataset_with_input_ids)}"" + ""\033[0m"")
+    
+    dataset_with_input_ids = dataset_with_input_ids.filter(lambda x: x['len'] <= max_sample_num_tokens, 
+                                                           num_proc=64,
+                                                    )
+    print(""\033[38;5;196m"" + f""Total number of filtered samples after removing samples longer than {max_sample_num_tokens} tokens: {len(dataset) - len(dataset_with_input_ids)}"" + ""\033[0m"")
+    
+    dataset_with_labels = dataset_with_input_ids.map(
+        lambda x: make_labels_from_input_ids(x, assistant_tk_ids, user_tk_ids),
+        num_proc=64,
+    )
+
+    dataset_with_labels = dataset_with_labels.map(
+        make_num_loss_tokens_from_labels,
+        num_proc=64,
+    )
+    
+    #printing some samples to check the results
+    random_indices = np.random.permutation(len(dataset_with_labels))[:2]
+    for i in random_indices:
+        sample = dataset_with_labels[int(i)]
+        print(""original messages:"")
+        print(""\033[38;5;10m"" + str(sample[""messages""]) + ""\033[0m"")
+        print(""input_ids:"")
+        print(""\033[38;5;51m"" + tokenizer.decode(sample[""input_ids""]) + ""\033[0m"")
+        print(""labels:"")
+        label_ids = [l if l != -100 else string_for_printing_masks_tk for l in sample[""labels""]]
+        print(""\033[38;5;208m"" + tokenizer.decode(label_ids) + ""\033[0m"")
+        print(""-""*100)
+    
+    dataset_with_labels.to_json(Path(output_jsonl), num_proc=64)
+
+if __name__ == ""__main__"":
+    app()
+
+'''
+# python process_data.py --input-file /new_data/knowledge_rh/quality/training_mix/entigraph_knowledge1.0_phi4_first_24_n_5_5_percent.jsonl \
+python process_data.py --input-file '/Users/aldo/Downloads/data.jsonl' \
+      --output-file ./some_product_puzzle_tokenized_qwen1.5b.jsonl \
+      --model-name-or-path Qwen/Qwen2.5-1.5B \
+      --string-for-printing-masks ""<|mAsK|>"" \
+      --max-sample-num-tokens 16384
+'''"
+"none_reduction_losses.py","import torch
+import torch.nn as nn
+from typing import Optional
+
+def liger_fixed_fused_linear_cross_entropy_none_reduction(
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    target: torch.Tensor,
+    num_items_in_batch: Optional[int] = None,
+    ignore_index: int = -100,
+    final_logit_softcapping: Optional[float] = None,
+    **kwargs,
+):
+    import liger_kernel.transformers.functional as F
+    # torch.distributed.breakpoint()
+    loss = F.liger_fused_linear_cross_entropy(
+        hidden_states,
+        lm_head_weight,
+        target,
+        reduction='none',
+        ignore_index=ignore_index,
+        softcap=final_logit_softcapping,
+    )
+
+    return loss
+
+def hf_fixed_cross_entropy_none_reduction(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    num_items_in_batch: Optional[int] = None,
+    ignore_index: int = -100,
+    **kwargs,
+) -> torch.Tensor:
+    # torch.distributed.breakpoint()
+    loss = nn.functional.cross_entropy(source, target, ignore_index=ignore_index, reduction='none')
+    return loss"
+"sampler.py","""""""
+This script implements a custom data loading and batching pipeline specifically
+designed for efficient distributed training of sequence models, particularly
+large language models, on multiple GPUs.
+
+Key Features:
+- Infinite Sampler: Provides an endless stream of shuffled data indices,
+  suitable for training for a fixed number of steps rather than epochs.
+- Initial Batching: Groups samples into initial batches based on a fixed number
+  of samples per batch.
+- Dynamic Minibatching for Distributed Training: Takes the initial batches and
+  further divides them into 'minibatches'. Each minibatch is a list distributed
+  across available ranks (GPUs). The allocation process aims to pack sequences
+  efficiently such that the total number of tokens processed by any single rank
+  within a minibatch step stays below a predefined maximum (`max_tokens_per_gpu`).
+  The number of minibatches generated from an initial batch can vary dynamically
+  depending on the lengths of the sequences in that batch.
+- Token-Based Load Balancing: Ensures that each GPU receives a comparable
+  computational load (measured in tokens) per step, optimizing hardware
+  utilization and preventing out-of-memory errors when dealing with variable
+  sequence lengths.
+- Padding/Dummy Samples: Handles cases where ranks might not have enough data
+  to fill a minibatch by using dummy samples, ensuring all ranks process the
+  same number of minibatches.
+""""""
+from itertools import chain
+
+import torch
+from torch.utils.data import Sampler, Dataset, DataLoader
+import torch.distributed as dist
+import numpy as np
+from datasets import load_dataset
+
+def reset_minibatches(num_ranks: int):
+    return [[] for _ in range(num_ranks)], np.zeros(num_ranks)
+
+def batch_lengths_to_minibatches(batch_lengths: list[int], max_tokens_per_rank: int, num_ranks: int, rank: int):
+    """"""Distributes indices from a batch into minibatches across ranks.
+
+    Takes a list of sequence lengths corresponding to samples in an initial batch
+    and distributes their indices into multiple 'minibatches'. Each minibatch
+    represents a step where data is processed concurrently across `num_ranks` GPUs.
+
+    The distribution aims to assign sequences (represented by their indices `sid`
+    in the original `batch_lengths` list) to ranks such that the sum of sequence
+    lengths (tokens) assigned to any single rank does not exceed
+    `max_tokens_per_rank`. It prioritizes assigning the next sequence to the rank
+    currently having the minimum total tokens assigned in the current minibatch.
+
+    If adding the next sequence to the least-loaded rank would exceed the limit,
+    the current minibatch is considered complete, and a new minibatch is started.
+
+    If the last minibatch is incomplete, ranks with no assigned sequences are
+    given a placeholder index of -1.
+
+    Args:
+        batch_lengths: A list where each element is the length (number of tokens)
+                       of a sequence in the initial batch.
+        max_tokens_per_rank: The maximum number of tokens allowed per rank in a
+                             single minibatch.
+        num_ranks: The total number of distributed training ranks (GPUs).
+        rank: The specific rank for which to retrieve the assigned indices.
+
+    Returns:
+        A list of lists. Each inner list contains the indices (from the original
+        batch) assigned to the specified `rank` for one minibatch. Placeholder -1
+        indicates padding.
+    """"""
+    minibatches_indices = []
+    current_minibatches_ids, current_minibatches_loads = reset_minibatches(num_ranks)
+    for sid, sample_len in enumerate(batch_lengths):
+        least_full_batch_id = np.argmin(current_minibatches_loads)
+        
+        if current_minibatches_loads[least_full_batch_id] + sample_len > max_tokens_per_rank:
+            '''when the least full minibatch is full, we need to start a new minibatch'''
+            minibatches_indices.append(current_minibatches_ids)
+            current_minibatches_ids, current_minibatches_loads = reset_minibatches(num_ranks)
+            least_full_batch_id = 0
+        
+        '''add sample to the least full minibatch'''
+        current_minibatches_ids[least_full_batch_id].append(sid)
+        current_minibatches_loads[least_full_batch_id] += sample_len
+    
+    if any(current_minibatches_loads):
+        for i in range(num_ranks):
+            if current_minibatches_loads[i] == 0:
+                current_minibatches_ids[i].append(-1)
+        minibatches_indices.append(current_minibatches_ids)
+        
+    return [m[rank] for m in minibatches_indices]
+
+class JsonlDataset(Dataset):
+    def __init__(self, path: str = ""/new_data/aldo/v1_reasoning/math_simplerl_qwen_data_token_ids.jsonl""):
+        dataset = load_dataset(""json"", data_files=path, split=""train"")
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index: int):
+        sample = self.dataset[int(index)]
+        # Ignore the index and return a fresh copy of the sequence tensor.
+        return {
+            'input_ids': torch.tensor(sample['input_ids'], dtype=torch.long),
+            'labels': torch.tensor(sample['labels'], dtype=torch.long),
+            'len': sample['len'],
+            'num_loss_counted_tokens': sample['num_loss_counted_tokens']
+        }
+    
+        
+class InfiniteSampler(Sampler):
+    """"""Infinitely yields shuffled dataset indices. Crucially, in distributed
+    training, it provides the *same* index sequence to all ranks.
+
+    Reshuffles indices using a seed incremented per cycle. The actual distribution
+    of samples/indices to specific ranks must be handled later (e.g., by a collate_fn).
+
+    Args:
+        len_data: The size of the dataset.
+        seed: Initial random seed for shuffling (incremented each cycle).
+    """"""
+    def __init__(self, len_data, seed: int = 37):
+        self.len_data = len_data
+        self.seed = seed
+
+    def __iter__(self):
+        """"""Yields an infinite stream of shuffled dataset indices.""""""
+        epoch = 0
+        while True:
+            g = torch.Generator()
+            g.manual_seed(self.seed + epoch)
+            indices = torch.randperm(self.len_data, generator=g).tolist()
+            yield from indices
+            epoch += 1
+    
+    def __len__(self):
+        return self.len_data
+    
+def mb_collate_fn(minibatch, batch_num_loss_counted_tokens):
+    """"""Collates a list of samples into a single packed batch for Flash Attention.
+
+    This function takes a 'minibatch' (list of pre-fetched dataset samples)
+    and concatenates their 'input_ids', 'labels', and generates corresponding
+    'position_ids'. It does *not* add padding.
+
+    The resulting batch format is 'packed' or 'unpadded', where multiple sequences
+    are concatenated into single tensors. Sequence boundaries are implicitly defined
+    by the 'position_ids', which restart from 0 for each concatenated sequence.
+
+    **IMPORTANT**: This format requires the downstream model's attention mechanism
+    (e.g., Flash Attention) to correctly handle packed sequences. Standard attention
+    implementations may not work correctly as they expect padded inputs and explicit
+    attention masks. Flash Attention typically uses mechanisms like `cu_seqlens`
+    (cumulative sequence lengths), derived from position IDs or sequence lengths,
+    to compute the correct block-diagonal attention implicitly.
+
+    Args:
+        minibatch: A list of dictionaries, where each dictionary represents a
+                   sample and contains at least 'input_ids' and 'labels'.
+
+    Returns:
+        A dictionary containing the collated batch:
+        - 'input_ids': Single tensor of concatenated input IDs.
+        - 'labels': Single tensor of concatenated labels.
+        - 'position_ids': Single tensor of position IDs, reset for each sequence.
+        - 'num_loss_counted_tokens': Total number of non-ignored label tokens (-100).
+        - 'num_samples': The number of sequences packed into this batch.
+    """"""
+    input_ids = []
+    labels = []
+    position_ids = []
+    total_len = 0
+    num_loss_counted_tokens = 0
+    # from ipdb import set_trace; set_trace()
+    # try:
+    num_samples = 0
+    for item in minibatch:
+        item_len = len(item[""input_ids""])
+
+        input_ids.extend(item[""input_ids""])
+        labels.extend(item[""labels""])
+        position_ids.extend(range(item_len))
+
+        total_len += item_len
+        # sample_loss_counted_tokens = (item[""labels""] != -100).sum().item()
+        num_loss_counted_tokens += item[""num_loss_counted_tokens""]
+        
+        '''dummy samples don't have labels != -100 and should not count'''
+        num_samples += 1 if item[""num_loss_counted_tokens""] > 0 else 0 
+
+    # print(
+    #     f""\033[96m total length: {total_len} ""
+    #     f""num_loss_counted_tokens: {num_loss_counted_tokens}\033[0m""
+    # )
+
+    return {
+        ""input_ids"": torch.tensor([input_ids], dtype=torch.long),
+        ""labels"": torch.tensor([labels], dtype=torch.long),
+        ""position_ids"": torch.tensor([position_ids], dtype=torch.long),
+        ""num_loss_counted_tokens"": num_loss_counted_tokens,
+        ""num_samples"": num_samples,
+        ""batch_num_loss_counted_tokens"": batch_num_loss_counted_tokens,
+    }
+    
+class MaxTokensPerRankCollator:
+    """"""A collate function for PyTorch DataLoader for distributed training.
+
+    This collator takes a batch of samples (obtained using indices from a sampler
+    like InfiniteSampler) and performs two main tasks:
+    1. Filters out samples longer than `max_tokens_per_rank`.
+    2. Uses `batch_lengths_to_minibatches` to determine how to distribute the
+       remaining samples across ranks into one or more 'minibatches', ensuring
+       no rank exceeds `max_tokens_per_rank` per minibatch.
+    3. For the current rank, it fetches the assigned samples (or dummy samples
+       for padding) for each determined minibatch.
+    4. Uses `mb_collate_fn` to collate the samples for each minibatch into the
+       packed format required by Flash Attention.
+
+    Args:
+        max_tokens_per_rank (int): Maximum number of tokens allowed per rank
+            in a single processed minibatch.
+        rank (int, optional): The rank of the current process. If None, attempts
+            to get it from `torch.distributed`.
+        world_size (int, optional): Total number of ranks. If None, attempts
+            to get it from `torch.distributed`.
+        dummy_sample (dict, optional): A sample used for padding when a rank
+            has no real samples assigned in a minibatch.
+    """"""
+    def __init__(self, max_tokens_per_rank: int, rank: int=None, world_size: int=None, dummy_sample=None):
+        self.max_tokens_per_rank = max_tokens_per_rank
+        self.rank = rank if rank is not None else dist.get_rank()
+        self.world_size = world_size if world_size is not None else dist.get_world_size()
+        if dummy_sample is None:
+            dummy_sample = {'input_ids': torch.tensor([15, 14, 13, 12, 11], dtype=torch.long),
+                            'labels': torch.tensor([-100, -100, -100, -100, -100], dtype=torch.long),
+                            'len': 5,
+                            'num_loss_counted_tokens': 0}
+        self.dummy_sample = dummy_sample
+
+    def __call__(self, batch: list[dict]):
+        """"""Processes a batch of samples into a list of packed minibatches for the current rank.
+
+        Args:
+            batch: A list of sample dictionaries from the Dataset.
+
+        Returns:
+            A list where each element is a dictionary representing a collated minibatch
+            (output of `mb_collate_fn`) ready for processing by the current rank.
+        """"""
+        batch_ = [b for b in batch if b['len'] <= self.max_tokens_per_rank]
+        if len(batch_) < len(batch):
+            print(f""\033[38;5;196mremoved {len(batch) - len(batch_)} samples from batch because they are longer than the max tokens per gpu\033[0m"")
+        batch_lengths = [sample['len'] for sample in batch]
+        batch_num_loss_counted_tokens = sum([sample['num_loss_counted_tokens'] for sample in batch])
+        all_minibatches_indices = batch_lengths_to_minibatches(batch_lengths, self.max_tokens_per_rank, self.world_size, self.rank)
+        
+        all_minibatches = []
+        for mb_indices in all_minibatches_indices:
+            mb = [batch[i] if i != -1 else self.dummy_sample for i in mb_indices]
+            all_minibatches.append(mb_collate_fn(mb, batch_num_loss_counted_tokens))
+
+        return all_minibatches
+    
+def get_data_loader(**kwargs):
+    # from ipdb import set_trace; set_trace()
+    dataset = JsonlDataset(kwargs['data_path'])
+    batch_size = kwargs['batch_size']
+    max_tokens_per_rank = kwargs['max_tokens_per_gpu']
+    seed = kwargs['seed']
+    rank = kwargs.get('rank', None)
+    world_size = kwargs.get('world_size', None)
+    dummy_sample = kwargs.get('dummy_sample', None)
+    return DataLoader(dataset, 
+                      batch_size, 
+                      sampler=InfiniteSampler(len(dataset), seed=seed),
+                      collate_fn=MaxTokensPerRankCollator(max_tokens_per_rank, 
+                                                          rank=rank, 
+                                                          world_size=world_size, 
+                                                          dummy_sample=dummy_sample),
+                      num_workers=4)
+
+if __name__ == ""__main__"":
+    data_loader = get_data_loader(data_path=""test.jsonl"",
+                                  batch_size=40,
+                                  max_tokens_per_gpu=5000,
+                                  seed=37,
+                                  rank=0,
+                                  world_size=2)
+    data_loader2 = get_data_loader(data_path=""test.jsonl"",
+                                  batch_size=26,
+                                  max_tokens_per_gpu=5000,
+                                  seed=37,
+                                  rank=1,
+                                  world_size=2)
+    data_loader = iter(data_loader)
+    data_loader2 = iter(data_loader2)
+    batch = next(data_loader)
+    batch2 = next(data_loader2)
+    from IPython import embed
+    embed()
+
+                
+"

@@ -1,0 +1,24 @@
+{
+  "make_messages.py": [],
+  "utils.py": [
+    "setup_model_for_training.py",
+    "train.py"
+  ],
+  "setup_model_for_training.py": [
+    "train.py"
+  ],
+  "train.py": [],
+  "batch_metrics.py": [
+    "train.py"
+  ],
+  "async_structured_logger.py": [
+    "train.py"
+  ],
+  "process_data.py": [],
+  "none_reduction_losses.py": [
+    "setup_model_for_training.py"
+  ],
+  "sampler.py": [
+    "train.py"
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "make_messages.py": {
+    "imports": [],
+    "used_by": []
+  },
+  "utils.py": {
+    "imports": [],
+    "used_by": [
+      "setup_model_for_training.py",
+      "train.py"
+    ]
+  },
+  "setup_model_for_training.py": {
+    "imports": [
+      "utils.py",
+      "none_reduction_losses.py"
+    ],
+    "used_by": [
+      "train.py"
+    ]
+  },
+  "train.py": {
+    "imports": [
+      "setup_model_for_training.py",
+      "async_structured_logger.py",
+      "sampler.py",
+      "utils.py",
+      "batch_metrics.py"
+    ],
+    "used_by": []
+  },
+  "batch_metrics.py": {
+    "imports": [],
+    "used_by": [
+      "train.py"
+    ]
+  },
+  "async_structured_logger.py": {
+    "imports": [],
+    "used_by": [
+      "train.py"
+    ]
+  },
+  "process_data.py": {
+    "imports": [],
+    "used_by": []
+  },
+  "none_reduction_losses.py": {
+    "imports": [],
+    "used_by": [
+      "setup_model_for_training.py"
+    ]
+  },
+  "sampler.py": {
+    "imports": [],
+    "used_by": [
+      "train.py"
+    ]
+  }
+}
