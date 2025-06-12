@@ -39,7 +39,7 @@ class LLMApi:
             # OpenAI official SDK >=1.84.0
             client = self.OpenAI(api_key=self.api_key, base_url=self.base_url) if self.base_url else self.OpenAI(api_key=self.api_key)
             response = client.chat.completions.create(
-                model=model or 'gpt-4.1',
+                model=model or 'gpt-4o-mini',
                 messages=messages,
                 **kwargs
             )
