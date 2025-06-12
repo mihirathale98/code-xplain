@@ -12,8 +12,8 @@
   },
   "setup_model_for_training.py": {
     "imports": [
-      "utils.py",
-      "none_reduction_losses.py"
+      "none_reduction_losses.py",
+      "utils.py"
     ],
     "used_by": [
       "train.py"
@@ -21,11 +21,11 @@
   },
   "train.py": {
     "imports": [
-      "setup_model_for_training.py",
       "async_structured_logger.py",
+      "setup_model_for_training.py",
       "sampler.py",
-      "utils.py",
-      "batch_metrics.py"
+      "batch_metrics.py",
+      "utils.py"
     ],
     "used_by": []
   },
