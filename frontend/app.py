@@ -60,6 +60,7 @@ def send_message(message: str):
 def load_repo(repo_url: str):
     """Load a repository for analysis"""
     if not repo_url:
+        st.error("Please enter a repository URL")
         return
     
     st.session_state.is_loading = True
@@ -115,33 +116,80 @@ def main():
     
     # Sidebar
     with st.sidebar:
-        st.title("Settings")
+        st.title("⚙️ Settings")
         
-        # Repository URL input
-        repo_url = st.text_input(
-            "Repository URL",
-            value=st.session_state.repo_url,
-            placeholder="https://github.com/owner/repo.git"
+        # Repository URL input section
+        st.subheader("📁 Repository")
+        repo_url_input = st.text_input(
+            "GitHub Repository URL",
+            placeholder="https://github.com/owner/repo.git",
+            help="Enter a GitHub repository URL to analyze"
         )
         
-        if repo_url != st.session_state.repo_url:
-            load_repo(repo_url)
+        # Load repository button
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            load_button = st.button(
+                "🚀 Load Repository",
+                disabled=st.session_state.is_loading or not repo_url_input.strip(),
+                help="Click to load the repository for analysis"
+            )
+        with col2:
+            if st.button("🔄", help="Refresh status"):
+                check_repo_status()
+                st.rerun()
+        
+        # Handle repository loading
+        if load_button and repo_url_input.strip():
+            load_repo(repo_url_input.strip())
+        
+        st.divider()
+        
+        # Chat controls section
+        st.subheader("💬 Chat Controls")
         
         # Reset chat button
-        if st.button("Reset Chat"):
+        if st.button("🗑️ Reset Chat", help="Clear chat history and start fresh"):
             reset_chat()
+            st.rerun()
         
-        # Session ID display
-        st.info(f"Session ID: {st.session_state.session_id}")
+        st.divider()
+        
+        # Status section
+        st.subheader("📊 Status")
         
         # Display repository status
         if st.session_state.repo_loaded:
-            st.success(f"Current Repository: {st.session_state.repo_url}")
+            st.success("✅ Repository Loaded")
+            st.info(f"**Current Repository:**\n{st.session_state.repo_url}")
         else:
-            st.warning("No repository loaded")
+            st.warning("⚠️ No Repository Loaded")
+            st.info("Load a repository to start analyzing code")
+        
+        # Session info
+        with st.expander("🔍 Session Info"):
+            st.text(f"Session ID: {st.session_state.session_id}")
+            st.text(f"Messages: {len(st.session_state.messages)}")
+            st.text(f"Loading: {st.session_state.is_loading}")
     
     # Main chat interface
-    st.title("Code Analysis Chat")
+    st.title("💻 Code Analysis Chat")
+    
+    # Welcome message when no repository is loaded
+    if not st.session_state.repo_loaded:
+        st.info("""
+        👋 **Welcome to Code-Xplain!**
+        
+        To get started:
+        1. Enter a GitHub repository URL in the sidebar
+        2. Click "🚀 Load Repository" 
+        3. Start asking questions about the codebase!
+        
+        **Example repositories to try:**
+        - `https://github.com/fastapi/fastapi.git`
+        - `https://github.com/streamlit/streamlit.git`
+        - `https://github.com/microsoft/vscode.git`
+        """)
     
     # Display chat messages
     for message in st.session_state.messages:
@@ -150,7 +198,7 @@ def main():
     
     # Chat input
     if prompt := st.chat_input(
-        "Ask about the codebase...",
+        "Ask about the codebase..." if st.session_state.repo_loaded else "Load a repository first to start chatting...",
         disabled=st.session_state.is_loading or not st.session_state.repo_loaded
     ):
         send_message(prompt)
