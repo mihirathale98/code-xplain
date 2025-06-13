@@ -1,5 +1,8 @@
 import os
 from typing import Optional, List
+import logging
+
+logger = logging.getLogger(__name__)
 
 class LLMApi:
     def __init__(self, provider: str, api_key: Optional[str] = None, base_url: Optional[str] = None, project: Optional[str] = None, location: Optional[str] = None):
@@ -22,10 +25,10 @@ class LLMApi:
                 raise ImportError("Please install anthropic: pip install anthropic")
         elif self.provider == 'gemini':
             try:
-                from google import genai
+                import google.generativeai as genai
                 self.genai = genai
             except ImportError:
-                raise ImportError("Please install google-genai: pip install google-genai")
+                raise ImportError("Please install google-generativeai: pip install google-generativeai")
         else:
             raise ValueError(f"Unsupported provider: {self.provider}")
 
@@ -59,7 +62,7 @@ class LLMApi:
             # Anthropic expects messages as a list of {role, content}
             response = client.messages.create(
                 model=model or 'claude-3-5-sonnet-latest',
-                max_tokens=kwargs.get('max_tokens', 1024),
+                max_tokens=kwargs.get('max_tokens', 32000),
                 messages=messages,
                 **{k: v for k, v in kwargs.items() if k != 'max_tokens'}
             )
@@ -70,23 +73,57 @@ class LLMApi:
                 return response.content
             return response
         elif self.provider == 'gemini':
-            # Google GenAI SDK >=1.19.0
-            # Use environment variable GOOGLE_API_KEY or pass api_key
-            if self.api_key:
-                client = self.genai.Client(api_key=self.api_key)
-            elif self.project and self.location:
-                client = self.genai.Client(vertexai=True, project=self.project, location=self.location)
-            else:
-                client = self.genai.Client()
-            # Gemini expects a single string or list of messages
-            prompt = messages[-1]['content'] if messages else ''
-            model_name = model or 'gemini-2.0-flash-001'
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                **kwargs
-            )
-            return getattr(response, 'text', str(response))
+            try:
+                # Configure Gemini
+                if self.api_key:
+                    self.genai.configure(api_key=self.api_key)
+                elif self.project and self.location:
+                    self.genai.configure(project=self.project, location=self.location)
+                
+                # Initialize the model
+                model_name = model or 'gemini-2.5-pro-preview-06-05'
+                logger.info(f"Using Gemini model: {model_name}")
+                
+                # Create a chat session
+                chat = self.genai.GenerativeModel(model_name=model_name)
+                
+                # Convert messages to Gemini format
+                chat_history = []
+                for msg in messages:
+                    if msg['role'] == 'user':
+                        chat_history.append({"role": "user", "parts": [msg['content']]})
+                    elif msg['role'] == 'assistant':
+                        chat_history.append({"role": "model", "parts": [msg['content']]})
+                    elif msg['role'] == 'system':
+                        # Add system message as context to the last user message
+                        if chat_history and chat_history[-1]['role'] == 'user':
+                            chat_history[-1]['parts'][0] = f"{msg['content']}\n\n{chat_history[-1]['parts'][0]}"
+                
+                # Generate response
+                logger.info("Generating response from Gemini...")
+                response = chat.generate_content(
+                    chat_history,
+                    generation_config=kwargs.get('generation_config', {
+                        'temperature': 0.7,
+                        'top_p': 0.95,
+                        'top_k': 40,
+                        'max_output_tokens': 32000,
+                    })
+                )
+                
+                # Extract and return the response text
+                if hasattr(response, 'text'):
+                    logger.info("Successfully generated response")
+                    return response.text
+                else:
+                    error_msg = f"Unexpected response format from Gemini: {response}"
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
+                    
+            except Exception as e:
+                error_msg = f"Error in Gemini chat: {str(e)}"
+                logger.error(error_msg)
+                raise
         else:
             raise ValueError(f"Unsupported provider: {self.provider}")
 

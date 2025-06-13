@@ -21,11 +21,11 @@
   },
   "train.py": {
     "imports": [
+      "setup_model_for_training.py",
       "sampler.py",
       "utils.py",
-      "async_structured_logger.py",
-      "setup_model_for_training.py",
-      "batch_metrics.py"
+      "batch_metrics.py",
+      "async_structured_logger.py"
     ],
     "used_by": []
   },

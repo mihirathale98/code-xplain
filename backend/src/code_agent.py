@@ -4,9 +4,12 @@ import re
 from typing import List, Dict, Optional, Tuple
 from pydantic import BaseModel
 import os
+import logging
 from llm_api import LLMApi
 from code_parser import analyze_repo
 from git_utils import GitUtils
+
+logger = logging.getLogger(__name__)
 
 class CodeSearchResult(BaseModel):
     """Model for code search results"""
@@ -14,6 +17,15 @@ class CodeSearchResult(BaseModel):
     code: str
     imports: List[str]
     used_by: List[str]
+
+class IntentAnalysis(BaseModel):
+    """Model for intent analysis results"""
+    intent_type: str
+    requires_tools: bool
+    confidence: float
+    reasoning: str
+    suggested_tools: List[str]
+    can_answer_from_context: bool
 
 class CodeAgent:
     def __init__(self, llm_provider: str, api_key: Optional[str] = None, github_token: Optional[str] = None):
@@ -53,6 +65,169 @@ class CodeAgent:
                 pass
         
         return {}, text
+
+    def identify_intent(self, query: str, chat_history: List[Dict] = None) -> Dict:
+        """Identify the intent of the user query and determine if tool calls are needed"""
+        logger.info(f"Identifying intent for query: {query[:100]}...")
+        
+        # Prepare chat history context
+        history_context = ""
+        if chat_history:
+            recent_history = chat_history[-6:]  # Last 6 messages for context
+            history_context = "\n".join([
+                f"{msg.get('role', 'unknown')}: {msg.get('content', '')[:200]}..."
+                for msg in recent_history
+            ])
+        
+        intent_prompt = f"""You are an intent identification agent for a code analysis system. 
+        Analyze the user's query and chat history to determine:
+        1. What the user is trying to accomplish
+        2. Whether tool calls are needed or if you can answer from conversation context
+        3. Which specific tools might be needed
+        
+        Available tools:
+        - read_file_structure: Get overview of codebase structure
+        - fetch_code: Get specific file content
+        - find_code_usage: Find dependencies and usage of files
+        - search_related_issues: Search GitHub issues/PRs
+        - get_issue_details: Get detailed issue information
+        
+        Intent types:
+        - code_analysis: Needs to examine specific code files
+        - architecture_overview: Needs file structure information
+        - issue_search: Needs to search GitHub issues/PRs
+        - issue_details: Needs specific issue information
+        - general_conversation: Can be answered without tools
+        - clarification: Asking for clarification or follow-up
+        - greeting: Simple greeting or introduction
+        
+        Return your analysis in JSON format:
+        ```json
+        {{
+            "intent_type": "one of the intent types above",
+            "requires_tools": true/false,
+            "confidence": 0.0-1.0,
+            "reasoning": "explanation of your decision",
+            "suggested_tools": ["list", "of", "tools", "if", "needed"],
+            "can_answer_from_context": true/false,
+            "response_strategy": "how to approach the response"
+        }}
+        ```
+        
+        Current Query: {query}
+        
+        Chat History:
+        {history_context if history_context else "No previous conversation"}
+        
+        Repository Status: {"Loaded" if self.current_repo_url else "Not loaded"}
+        """
+        
+        try:
+            intent_response = self.llm.chat(messages=[{"role": "user", "content": intent_prompt}])
+            intent_data, _ = self._extract_json(intent_response)
+            
+            if not intent_data:
+                # Fallback intent analysis
+                logger.warning("Failed to parse intent JSON, using fallback analysis")
+                intent_data = self._fallback_intent_analysis(query, chat_history)
+            
+            logger.info(f"Intent identified: {intent_data.get('intent_type')} (confidence: {intent_data.get('confidence')})")
+            return intent_data
+            
+        except Exception as e:
+            logger.error(f"Error in intent identification: {str(e)}")
+            return self._fallback_intent_analysis(query, chat_history)
+
+    def _fallback_intent_analysis(self, query: str, chat_history: List[Dict] = None) -> Dict:
+        """Fallback intent analysis using simple heuristics"""
+        query_lower = query.lower()
+        
+        # Simple keyword-based intent detection
+        if any(word in query_lower for word in ['hello', 'hi', 'hey', 'greetings']):
+            return {
+                "intent_type": "greeting",
+                "requires_tools": False,
+                "confidence": 0.9,
+                "reasoning": "Query contains greeting words",
+                "suggested_tools": [],
+                "can_answer_from_context": True,
+                "response_strategy": "friendly_greeting"
+            }
+        
+        if any(word in query_lower for word in ['issue', 'bug', 'pr', 'pull request', 'problem']):
+            return {
+                "intent_type": "issue_search",
+                "requires_tools": True,
+                "confidence": 0.8,
+                "reasoning": "Query mentions issues or bugs",
+                "suggested_tools": ["search_related_issues"],
+                "can_answer_from_context": False,
+                "response_strategy": "search_and_analyze"
+            }
+        
+        if any(word in query_lower for word in ['structure', 'architecture', 'overview', 'files']):
+            return {
+                "intent_type": "architecture_overview",
+                "requires_tools": True,
+                "confidence": 0.8,
+                "reasoning": "Query asks about code structure",
+                "suggested_tools": ["read_file_structure"],
+                "can_answer_from_context": False,
+                "response_strategy": "structural_analysis"
+            }
+        
+        # Default to code analysis if repository is loaded
+        if self.current_repo_url:
+            return {
+                "intent_type": "code_analysis",
+                "requires_tools": True,
+                "confidence": 0.6,
+                "reasoning": "General code-related query with repository loaded",
+                "suggested_tools": ["read_file_structure", "fetch_code"],
+                "can_answer_from_context": False,
+                "response_strategy": "comprehensive_analysis"
+            }
+        
+        return {
+            "intent_type": "general_conversation",
+            "requires_tools": False,
+            "confidence": 0.7,
+            "reasoning": "No specific code analysis intent detected",
+            "suggested_tools": [],
+            "can_answer_from_context": True,
+            "response_strategy": "conversational"
+        }
+
+    def handle_conversational_response(self, query: str, chat_history: List[Dict] = None, intent_data: Dict = None) -> str:
+        """Handle responses that don't require tool calls"""
+        logger.info("Generating conversational response without tool calls")
+        
+        # Prepare context from chat history
+        context = ""
+        if chat_history:
+            recent_history = chat_history[-4:]  # Last 4 messages for context
+            context = "\n".join([
+                f"{msg.get('role', 'unknown')}: {msg.get('content', '')}"
+                for msg in recent_history
+            ])
+        
+        conversational_prompt = f"""You are a helpful code analysis assistant. The user's query doesn't require specific tool calls or code examination.
+        
+        Respond naturally and helpfully based on the conversation context and your general knowledge.
+        
+        Intent Analysis: {json.dumps(intent_data, indent=2) if intent_data else "Not available"}
+        
+        Recent Conversation:
+        {context if context else "No previous conversation"}
+        
+        Current Query: {query}
+        
+        Repository Status: {"Repository loaded and ready for analysis" if self.current_repo_url else "No repository currently loaded"}
+        
+        Provide a helpful, conversational response. If the user needs code analysis, guide them on how to ask specific questions about the codebase.
+        """
+        
+        return self.llm.chat(messages=[{"role": "user", "content": conversational_prompt}])
 
     def read_file_structure(self) -> Dict:
         """Read and return the complete file structure of the codebase"""
@@ -96,14 +271,33 @@ class CodeAgent:
             return {"error": "No repository loaded"}
         
         try:
+            logger.info(f"Searching for issues related to: {query}")
             issues = self.git.search_related_issues(self.current_repo_url, query)
+            logger.info(f"Found {len(issues)} related issues/PRs")
+            
+            # Format issues for better display
+            formatted_issues = []
+            for issue in issues[:10]:  # Return top 10 results
+                formatted_issues.append({
+                    "number": issue.get("number"),
+                    "title": issue.get("title"),
+                    "state": issue.get("state"),
+                    "url": issue.get("html_url"),
+                    "created_at": issue.get("created_at"),
+                    "updated_at": issue.get("updated_at"),
+                    "labels": [label.get("name") for label in issue.get("labels", [])],
+                    "is_pull_request": "pull_request" in issue
+                })
+            
             return {
                 "total_results": len(issues),
-                "issues": issues[:5],  # Return top 5 results
+                "issues": formatted_issues,
                 "query": query
             }
         except Exception as e:
-            return {"error": str(e)}
+            error_msg = f"Error searching issues: {str(e)}"
+            logger.error(error_msg)
+            return {"error": error_msg}
 
     def get_issue_details(self, issue_number: int) -> Dict:
         """Get detailed information about a specific issue"""
@@ -111,12 +305,16 @@ class CodeAgent:
             return {"error": "No repository loaded"}
         
         try:
+            logger.info(f"Getting details for issue #{issue_number}")
             return self.git.get_issue_details(self.current_repo_url, issue_number)
         except Exception as e:
-            return {"error": str(e)}
+            error_msg = f"Error getting issue details: {str(e)}"
+            logger.error(error_msg)
+            return {"error": error_msg}
 
     def load_repo_data(self, repo_url: str):
         """Load repository data using code_parser and git utilities"""
+        logger.info(f"Loading repository data for: {repo_url}")
         self.current_repo_url = repo_url
         self.file_structure, csv_str, self.usage_lookup = analyze_repo(repo_url)
         
@@ -126,9 +324,11 @@ class CodeAgent:
         
         # Load repository metadata
         try:
+            logger.info("Loading repository metadata...")
             self.git.get_repo_metadata(repo_url)
+            logger.info("Repository metadata loaded successfully")
         except Exception as e:
-            print(f"Warning: Could not load repository metadata: {e}")
+            logger.warning(f"Could not load repository metadata: {e}")
 
     def analyze_code(self, query: str) -> str:
         """Analyze code based on user query"""
@@ -138,96 +338,98 @@ class CodeAgent:
         ]
         return self.llm.chat(messages=messages)
 
-    def run(self, query: str) -> str:
-        """Run the agent with a query"""
-        print("\n=== Starting Analysis ===")
-        print(f"Query: {query}")
+    def run(self, query: str, chat_history: List[Dict] = None) -> str:
+        """Run the agent with a query, using intent identification to determine approach"""
+        logger.info(f"Starting analysis for query: {query}")
         
-        # First, get the file structure
-        print("\n=== Tool: read_file_structure ===")
+        # Step 1: Identify intent
+        intent_data = self.identify_intent(query, chat_history)
+        logger.info(f"Intent analysis: {intent_data.get('intent_type')} (requires_tools: {intent_data.get('requires_tools')})")
+        
+        # Step 2: Handle based on intent
+        if not intent_data.get('requires_tools', True):
+            # Handle conversational responses without tool calls
+            return self.handle_conversational_response(query, chat_history, intent_data)
+        
+        # Step 3: Repository check for tool-requiring intents
+        if intent_data.get('requires_tools') and not self.current_repo_url:
+            return "I'd be happy to help with code analysis, but no repository is currently loaded. Please load a repository first using the repository URL input, then I can analyze the code, search for issues, or examine the file structure."
+        
+        # Step 4: Execute tool-based analysis
+        return self._execute_tool_based_analysis(query, chat_history, intent_data)
+
+    def _execute_tool_based_analysis(self, query: str, chat_history: List[Dict], intent_data: Dict) -> str:
+        """Execute analysis that requires tool calls"""
+        logger.info("Executing tool-based analysis")
+        
+        # Get file structure (always useful for context)
         file_structure = self.read_file_structure()
-        print(f"Found {len(file_structure['file_structure'])} files")
-        print(f"Python files: {file_structure['file_types']['python']}")
-        print(f"Other files: {file_structure['file_types']['other']}")
+        logger.info(f"Found {len(file_structure['file_structure'])} files")
         
-        # Check if query is about issues or PRs
-        if any(keyword in query.lower() for keyword in ['issue', 'bug', 'pr', 'pull request', 'feature request']):
-            print("\n=== Tool: search_related_issues ===")
-            issues = self.search_related_issues(query)
-            if "error" not in issues:
-                print(f"Found {issues['total_results']} related issues/PRs")
-                for issue in issues['issues']:
-                    print(f"Issue #{issue['number']}: {issue['title']}")
-            else:
-                print(f"Error searching issues: {issues['error']}")
-        
-        # Create a context with the file structure
-        context = {
-            "file_structure": file_structure,
-            "query": query
-        }
-        
-        # Analyze the query and determine which files to examine
-        analysis_prompt = f"""Based on the following query and file structure, determine which files to examine.
-        Return your response in the following JSON format:
-
-        ```json
-        {{
-            "files_to_examine": ["list", "of", "file", "paths"],
-            "analysis_plan": "brief description of how to analyze these files"
-        }}
-        ```
-
-        Query: {query}
-        File Structure: {json.dumps(file_structure, indent=2)}
-        """
-        
-        analysis_response = self.llm.chat(messages=[{"role": "user", "content": analysis_prompt}])
-        analysis, _ = self._extract_json(analysis_response)
-        
-        # Gather information about the relevant files
-        print("\n=== Tool: fetch_code and find_code_usage ===")
+        # Execute tools based on intent
+        issues_data = None
         file_info = {}
-        for file_path in analysis.get("files_to_examine", []):
-            print(f"\nExamining file: {file_path}")
-            code_result = self.fetch_code(file_path)
-            usage_result = self.find_code_usage(file_path)
-            
-            if "error" in code_result:
-                print(f"Error fetching code: {code_result['error']}")
+        
+        suggested_tools = intent_data.get('suggested_tools', [])
+        
+        # Search for issues if suggested
+        if 'search_related_issues' in suggested_tools:
+            logger.info("Searching for related issues...")
+            issues_data = self.search_related_issues(query)
+            if "error" not in issues_data:
+                logger.info(f"Found {issues_data['total_results']} related issues/PRs")
             else:
-                print(f"Found {len(code_result['imports'])} imports")
-                print(f"Used by {len(code_result['used_by'])} files")
+                logger.error(f"Error searching issues: {issues_data['error']}")
+        
+        # Analyze files if needed
+        if any(tool in suggested_tools for tool in ['fetch_code', 'find_code_usage']) or intent_data.get('intent_type') == 'code_analysis':
+            # Determine which files to examine
+            analysis_prompt = f"""Based on the query and file structure, determine which files to examine.
+            Return your response in JSON format:
+
+            ```json
+            {{
+                "files_to_examine": ["list", "of", "file", "paths"],
+                "analysis_plan": "brief description of analysis approach"
+            }}
+            ```
+
+            Query: {query}
+            Intent: {intent_data.get('intent_type')}
+            File Structure: {json.dumps(file_structure, indent=2)}
+            """
             
-            if "error" in usage_result:
-                print(f"Error finding usage: {usage_result['error']}")
-            else:
-                print(f"Total dependencies: {usage_result['total_dependencies']}")
-                print(f"Total dependents: {usage_result['total_dependents']}")
+            analysis_response = self.llm.chat(messages=[{"role": "user", "content": analysis_prompt}])
+            analysis, _ = self._extract_json(analysis_response)
             
-            file_info[file_path] = {
-                "code": code_result,
-                "usage": usage_result
-            }
+            # Gather file information
+            for file_path in analysis.get("files_to_examine", [])[:5]:  # Limit to 5 files
+                logger.info(f"Examining file: {file_path}")
+                code_result = self.fetch_code(file_path)
+                usage_result = self.find_code_usage(file_path)
+                
+                file_info[file_path] = {
+                    "code": code_result,
+                    "usage": usage_result
+                }
         
         # Generate final response
-        final_prompt = f"""Based on the following information, answer the user's query.
-        If your response contains any structured data, format it as JSON between triple backticks.
+        final_prompt = f"""Based on the following information, provide a comprehensive response to the user's query.
 
         Query: {query}
+        Intent Analysis: {json.dumps(intent_data, indent=2)}
+        File Structure: {json.dumps(file_structure, indent=2)}
         File Information: {json.dumps(file_info, indent=2)}
-        Analysis Plan: {analysis.get('analysis_plan', '')}
+        Issues Information: {json.dumps(issues_data, indent=2) if issues_data else "No issues data"}
+        
+        Chat History Context:
+        {json.dumps(chat_history[-4:] if chat_history else [], indent=2)}
 
-        Provide a detailed and well-structured response.
+        Provide a detailed, well-structured response that directly addresses the user's query.
+        Include relevant code examples, issue references, or architectural insights as appropriate.
         """
         
-        print("\n=== Generating Final Response ===")
+        logger.info("Generating final response...")
         final_response = self.llm.chat(messages=[{"role": "user", "content": final_prompt}])
-        
-        # Extract any JSON from the final response
-        json_data, remaining_text = self._extract_json(final_response)
-        if json_data:
-            print("\n=== Found Structured Data ===")
-            print(f"JSON keys: {list(json_data.keys())}")
         
         return final_response
