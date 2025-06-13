@@ -1,0 +1,38 @@
+# Code-Xplain Backend Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core FastAPI Backend Dependencies (Required)
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+requests==2.31.0
+python-multipart==0.0.6
+python-dotenv==1.0.0
+
+# LLM Provider Dependencies (Install based on your choice)
+# Default: Google Gemini (recommended)
+google-generativeai==0.3.2
+
+# Alternative LLM Providers (optional - comment/uncomment as needed)
+# For OpenAI GPT models:
+# openai==1.6.1
+
+# For Anthropic Claude models:
+# anthropic==0.8.1
+
+# Data Processing and Utilities
+regex==2023.10.3
+
+# Optional: Enhanced Development Experience
+colorlog==6.8.0
+
+# Optional: Testing Dependencies (uncomment if developing)
+# pytest==7.4.3
+# pytest-asyncio==0.21.1
+# httpx==0.25.2
+
+# Installation Instructions:
+# 1. Default (Gemini): pip install -r requirements.txt
+# 2. For OpenAI: Uncomment openai line above, then pip install -r requirements.txt
+# 3. For Anthropic: Uncomment anthropic line above, then pip install -r requirements.txt
+# 4. For multiple providers: Uncomment desired lines, then pip install -r requirements.txt 

@@ -49,19 +49,21 @@ cd code-xplain
 # Navigate to backend
 cd backend
 
-# Install core dependencies
-pip install fastapi uvicorn requests pydantic
+# Install dependencies (includes Gemini by default)
+pip install -r requirements.txt
 
-# Install LLM provider dependencies (choose one or more)
-pip install google-generativeai  # For Gemini
-pip install openai              # For OpenAI/Together AI
-pip install anthropic           # For Anthropic Claude
+# Optional: For other LLM providers, edit requirements.txt first
+# Uncomment the desired provider lines in requirements.txt, then:
+# pip install -r requirements.txt
+```
 
+#### Set Environment Variables
+```bash
 # Set environment variables (choose based on your provider)
-export GOOGLE_API_KEY='your-google-api-key-here'      # For Gemini
-export OPENAI_API_KEY='your-openai-api-key-here'      # For OpenAI
-export ANTHROPIC_API_KEY='your-anthropic-api-key'     # For Anthropic
-export TOGETHER_API_KEY='your-together-api-key'       # For Together AI
+export GOOGLE_API_KEY='your-google-api-key-here'      # For Gemini (default)
+export OPENAI_API_KEY='your-openai-api-key-here'      # For OpenAI (if enabled)
+export ANTHROPIC_API_KEY='your-anthropic-api-key'     # For Anthropic (if enabled)
+export TOGETHER_API_KEY='your-together-api-key'       # For Together AI (if enabled)
 export GITHUB_TOKEN='your-github-token-here'          # Optional but recommended
 ```
 
