@@ -39,7 +39,7 @@ code-xplain/
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/your-username/code-xplain.git
+git clone [https://github.com/your-username/code-xplain.git](https://github.com/mihirathale98/code-xplain.git)
 cd code-xplain
 ```
 
