@@ -23,16 +23,16 @@ code-xplain/
 │       ├── llm_api.py      # LLM provider abstraction
 │       ├── git_utils.py    # GitHub API integration
 │       └── code_parser.py  # Repository parsing utilities
-└── frontend/               # Streamlit frontend
-    ├── app.py             # Main Streamlit application
-    └── requirements.txt   # Frontend dependencies
+├── frontend/               # Streamlit frontend
+│   └── app.py             # Main Streamlit application
+└── requirements.txt        # Project dependencies
 ```
 
 ## 🛠️ Setup & Installation
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.10+
 - Google API Key (for Gemini 2.5 Pro)
 - GitHub Token (optional, for enhanced API limits)
 - Conda (recommended for environment management)
@@ -44,30 +44,20 @@ code-xplain/
 conda create -n code-xplain python=3.10
 conda activate code-xplain
 
-# Install dependencies
-pip install -r requirements.txt
 ```
 
-### 2. Clone the Repository
+### 2. Clone the Repository and Install Dependencies
 
 ```bash
 git clone https://github.com/mihirathale98/code-xplain.git
 cd code-xplain
+
+# Install dependencies
+pip install -r requirements.txt
 ```
 
 ### 3. Backend Setup
 
-```bash
-# Navigate to backend
-cd backend
-
-# Install dependencies (includes Gemini by default)
-pip install -r requirements.txt
-
-# Optional: For other LLM providers, edit requirements.txt first
-# Uncomment the desired provider lines in requirements.txt, then:
-# pip install -r requirements.txt
-```
 
 #### Set Environment Variables
 ```bash
@@ -79,15 +69,6 @@ export TOGETHER_API_KEY='your-together-api-key'       # For Together AI (if enab
 export GITHUB_TOKEN='your-github-token-here'          # Optional but recommended
 ```
 
-### 4. Frontend Setup
-
-```bash
-# Navigate to frontend
-cd frontend
-
-# Install dependencies
-pip install -r requirements.txt
-```
 
 ## 🚀 Running the Application
 
