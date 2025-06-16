@@ -1,13 +1,16 @@
-# Code-Xplain Backend Dependencies
+# Code-Xplain Dependencies
 # Install with: pip install -r requirements.txt
 
-# Core FastAPI Backend Dependencies (Required)
+# Core Backend Dependencies (Required)
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 pydantic==2.5.0
-requests==2.31.0
 python-multipart==0.0.6
 python-dotenv==1.0.0
+
+# Frontend Dependencies
+streamlit==1.32.0
+requests==2.31.0
 
 # LLM Provider Dependencies (Install based on your choice)
 # Default: Google Gemini (recommended)

@@ -35,15 +35,27 @@ code-xplain/
 - Python 3.8+
 - Google API Key (for Gemini 2.5 Pro)
 - GitHub Token (optional, for enhanced API limits)
+- Conda (recommended for environment management)
 
-### 1. Clone the Repository
+### 1. Create Conda Environment
+
+```bash
+# Create and activate conda environment
+conda create -n code-xplain python=3.10
+conda activate code-xplain
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### 2. Clone the Repository
 
 ```bash
 git clone https://github.com/your-username/code-xplain.git
 cd code-xplain
 ```
 
-### 2. Backend Setup
+### 3. Backend Setup
 
 ```bash
 # Navigate to backend
@@ -67,7 +79,7 @@ export TOGETHER_API_KEY='your-together-api-key'       # For Together AI (if enab
 export GITHUB_TOKEN='your-github-token-here'          # Optional but recommended
 ```
 
-### 3. Frontend Setup
+### 4. Frontend Setup
 
 ```bash
 # Navigate to frontend
