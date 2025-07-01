@@ -4,6 +4,9 @@ import uuid
 from typing import List, Dict
 import json
 import time
+import asyncio
+import aiohttp
+from sseclient import SSEClient
 
 # API configuration
 API_URL = "http://localhost:8000"
@@ -29,29 +32,151 @@ def reset_chat():
         st.session_state.session_id = str(uuid.uuid4())
         st.success("Chat session reset successfully!")
 
-def send_message(message: str):
-    """Send a message to the API and get response"""
+def handle_stream_message(message_data: Dict, placeholder, thinking_placeholder):
+    """Handle different types of streaming messages"""
+    try:
+        msg_type = message_data.get("type")
+        data = message_data.get("data")
+        
+        if not msg_type or data is None:
+            st.warning("Received invalid message format from server")
+            return
+        
+        # Initialize session state for this placeholder if not exists
+        placeholder_id = str(id(placeholder))
+        if f"thinking_text_{placeholder_id}" not in st.session_state:
+            st.session_state[f"thinking_text_{placeholder_id}"] = ""
+        if f"response_text_{placeholder_id}" not in st.session_state:
+            st.session_state[f"response_text_{placeholder_id}"] = ""
+        
+        # Handle different message types
+        if msg_type in ["intent", "status", "pr_metadata", "test_results", "review", 
+                       "summary", "code_analysis", "test_suite", "coverage", "suggestions",
+                       "issue_search_results", "issue_details_data"]:
+            # Add to thinking process
+            if msg_type == "intent":
+                new_text = f"🤔 Understanding request... ({data.get('intent_type', 'unknown')})\n"
+            elif msg_type == "status":
+                new_text = f"⏳ {data}\n"
+            elif msg_type == "pr_metadata":
+                new_text = "📝 Generated PR metadata\n"
+            elif msg_type == "test_results":
+                new_text = "🧪 Generated test results\n"
+            elif msg_type == "review":
+                new_text = "👀 Completed code review\n"
+            elif msg_type == "summary":
+                new_text = "📊 Generated summary\n"
+            elif msg_type == "code_analysis":
+                new_text = "🔍 Completed code analysis\n"
+            elif msg_type == "test_suite":
+                new_text = "🧪 Generated test suite\n"
+            elif msg_type == "coverage":
+                new_text = "📊 Generated coverage report\n"
+            elif msg_type == "suggestions":
+                new_text = "💡 Generated improvement suggestions\n"
+            elif msg_type == "issue_search_results":
+                new_text = "🔍 Found matching issues\n"
+            elif msg_type == "issue_details_data":
+                new_text = "📋 Retrieved issue details\n"
+            
+            # Update thinking text
+            st.session_state[f"thinking_text_{placeholder_id}"] += new_text
+            thinking_placeholder.markdown(f"### 🤔 Thinking and Executing\n{st.session_state[f'thinking_text_{placeholder_id}']}")
+            
+
+            print(data)
+            # Show detailed data in an expander if available
+            if msg_type not in ["intent", "status"] and data:
+                expander_title = {
+                    "issue_search_results": "🔍 Search Results",
+                    "issue_details_data": "📋 Issue Details",
+                }.get(msg_type, f"Details for {msg_type}")
+                
+                with st.expander(expander_title, expanded=False):
+                    
+                    st.markdown(data)
+        
+        elif msg_type == "token":
+            # Update response text
+            st.session_state[f"response_text_{placeholder_id}"] += data
+            placeholder.markdown(st.session_state[f"response_text_{placeholder_id}"])
+        
+        elif msg_type == "response":
+            # For final response
+            placeholder.markdown(data)
+            st.session_state[f"response_text_{placeholder_id}"] = data
+        
+        elif msg_type == "error":
+            st.error(f"Error: {data}")
+        
+        else:
+            st.warning(f"Unknown message type: {msg_type}")
+                
+    except Exception as e:
+        st.error(f"Error displaying message: {str(e)}")
+
+async def send_message_stream(message: str):
+    """Send a message to the API and handle streaming response"""
     if not message:
         return
     
     st.session_state.is_loading = True
+    response_content = ""
     
     try:
         # Add user message to chat
         st.session_state.messages.append({"role": "user", "content": message})
         
-        # Send message to API
-        response = requests.post(
-            f"{API_URL}/chat/{st.session_state.session_id}",
-            json={"role": "user", "content": message}
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            # Add assistant's response to messages
-            st.session_state.messages.append({"role": "assistant", "content": data["response"]})
-        else:
-            st.error(f"Error: {response.text}")
+        # Create placeholders for thinking process and response
+        with st.chat_message("assistant"):
+            thinking_placeholder = st.empty()
+            response_placeholder = st.empty()
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{API_URL}/chat/{st.session_state.session_id}/stream",
+                    json={"role": "user", "content": message},
+                    timeout=aiohttp.ClientTimeout(total=300)  # 5 minutes timeout
+                ) as response:
+                    
+                    if response.status != 200:
+                        error_text = await response.text()
+                        st.error(f"Error from server: {error_text}")
+                        return
+                    
+                    # Handle streaming response
+                    async for line in response.content:
+                        if line:
+                            try:
+                                message_data = json.loads(line.decode().strip())
+                                handle_stream_message(message_data, response_placeholder, thinking_placeholder)
+                                
+                                # Accumulate response content
+                                if message_data.get("type") == "response":
+                                    response_content = message_data.get("data", "")
+                                elif message_data.get("type") == "token":
+                                    response_content += message_data.get("data", "")
+                                elif message_data.get("type") == "error":
+                                    st.error(message_data.get("data", "Unknown error"))
+                                    return
+                            except json.JSONDecodeError as e:
+                                st.warning(f"Failed to parse server message: {line.decode()}")
+                                continue
+                            except Exception as e:
+                                st.error(f"Error processing message: {str(e)}")
+                                continue
+                    
+                    # Add final response to messages if we got one
+                    if response_content:
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": response_content
+                        })
+                    
+    except aiohttp.ClientError as e:
+        st.error(f"Network error: {str(e)}")
+    except asyncio.TimeoutError:
+        st.error("Request timed out. Please try again.")
     except Exception as e:
         st.error(f"Error: {str(e)}")
     finally:
@@ -104,7 +229,7 @@ def check_repo_status():
 
 def main():
     st.set_page_config(
-        page_title="Code Analysis Chat",
+        page_title="Code QA",
         page_icon="💻",
         layout="wide"
     )
@@ -173,7 +298,7 @@ def main():
             st.text(f"Loading: {st.session_state.is_loading}")
     
     # Main chat interface
-    st.title("💻 Code Analysis Chat")
+    st.title("💻 Code QA")
     
     # Welcome message when no repository is loaded
     if not st.session_state.repo_loaded:
@@ -198,11 +323,11 @@ def main():
     
     # Chat input
     if prompt := st.chat_input(
-        "Ask about the codebase..." if st.session_state.repo_loaded else "Load a repository first to start chatting...",
-        disabled=st.session_state.is_loading or not st.session_state.repo_loaded
+        placeholder="Ask about the code...",
+        disabled=not st.session_state.repo_loaded or st.session_state.is_loading
     ):
-        send_message(prompt)
-        st.rerun()  # Rerun to update the display
+        # Use asyncio to handle streaming
+        asyncio.run(send_message_stream(prompt))
     
     # Loading indicator
     if st.session_state.is_loading:
